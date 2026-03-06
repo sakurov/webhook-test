@@ -5,6 +5,35 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart';
 import 'package:shelf_router/shelf_router.dart';
 
+// --- Persistence ---
+
+const _dbPath = 'webhooks_db.json';
+
+void _saveEvents() {
+  try {
+    final file = File(_dbPath);
+    final json = jsonEncode(_events.map((e) => e.toJson()).toList());
+    file.writeAsStringSync(json);
+  } catch (e) {
+    print('Failed to save events: $e');
+  }
+}
+
+void _loadEvents() {
+  try {
+    final file = File(_dbPath);
+    if (file.existsSync()) {
+      final content = file.readAsStringSync();
+      final List<dynamic> json = jsonDecode(content);
+      _events.clear();
+      _events.addAll(json.map((j) => WebhookEvent.fromJson(j)));
+      print('Loaded ${_events.length} events from database.');
+    }
+  } catch (e) {
+    print('Failed to load events: $e');
+  }
+}
+
 // --- Models ---
 
 class WebhookEvent {
@@ -25,6 +54,18 @@ class WebhookEvent {
     required this.body,
     required this.sourceIp,
   });
+
+  factory WebhookEvent.fromJson(Map<String, dynamic> json) {
+    return WebhookEvent(
+      timestamp: DateTime.parse(json['timestamp']),
+      method: json['method'],
+      path: json['path'],
+      queryParams: Map<String, String>.from(json['queryParams'] ?? {}),
+      headers: Map<String, String>.from(json['headers'] ?? {}),
+      body: json['body'],
+      sourceIp: json['sourceIp'],
+    );
+  }
 
   Map<String, dynamic> toJson() => {
     'timestamp': timestamp.toIso8601String(),
@@ -80,6 +121,8 @@ Future<Response> _webhookHandler(Request req) async {
   _events.insert(0, event);
   if (_events.length > 50) _events.removeLast();
 
+  _saveEvents();
+
   print('Received webhook: ${req.method} ${req.url}');
 
   return Response.ok(
@@ -90,6 +133,7 @@ Future<Response> _webhookHandler(Request req) async {
 
 Response _clearHandler(Request req) {
   _events.clear();
+  _saveEvents();
   return Response.ok(
     jsonEncode({'status': 'cleared'}),
     headers: {'Content-Type': 'application/json'},
@@ -99,6 +143,8 @@ Response _clearHandler(Request req) {
 // --- Main ---
 
 void main(List<String> args) async {
+  _loadEvents();
+
   final ip = InternetAddress.anyIPv4;
   final port = int.parse(Platform.environment['PORT'] ?? '8080');
 
@@ -135,6 +181,24 @@ String _getHtmlUi() {
             --header-key: #ec4899;
             --header-val: #10b981;
         }
+        /* --- Beautiful Scrollbars --- */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(15, 23, 42, 0.1);
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 10px;
+            border: 2px solid var(--card);
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--accent);
+        }
+
         body {
             font-family: 'Outfit', sans-serif;
             background: var(--bg);
@@ -144,10 +208,12 @@ String _getHtmlUi() {
             display: flex;
             flex-direction: column;
             align-items: center;
+            overflow-x: hidden; /* Fix bug 2: Prevent global horizontal scroll */
         }
         .container {
             width: 100%;
             max-width: 1000px;
+            box-sizing: border-box;
         }
         header {
             display: flex;
@@ -183,7 +249,7 @@ String _getHtmlUi() {
             color: var(--subtext);
             border: 2px dashed #334155;
         }
-        .event-list { display: grid; gap: 1.5rem; }
+        .event-list { display: grid; gap: 1.5rem; width: 100%; }
         .event-card {
             background: var(--card);
             border-radius: 20px;
@@ -191,6 +257,9 @@ String _getHtmlUi() {
             border: 1px solid #334155;
             box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
             transition: border-color 0.2s;
+            max-width: 100%; /* Fix bug 2: Ensure card stays in container */
+            box-sizing: border-box;
+            overflow: hidden;
         }
         .event-card:hover { border-color: var(--accent); }
         .event-meta {
@@ -246,12 +315,17 @@ String _getHtmlUi() {
             padding: 1rem;
             border-radius: 12px;
             font-family: 'JetBrains Mono', monospace;
-            overflow-x: auto;
-            max-height: 400px;
-            font-size: 0.9rem;
+            overflow-x: auto; /* Fix bug 2: Local horizontal scroll */
+            overflow-y: auto;
+            max-height: 200px; /* Constrained to match headers */
+            font-size: 0.85rem;
             margin: 0;
             color: #cbd5e1;
             border-left: 3px solid var(--accent);
+            width: 100%;
+            box-sizing: border-box;
+            white-space: pre-wrap;
+            word-break: break-all;
         }
         .badge {
             font-size: 0.7rem;
@@ -281,11 +355,44 @@ String _getHtmlUi() {
     </div>
 
     <script>
+        const scrollCache = {}; // Fix bug 1: Store scroll positions
+
         async function fetchEvents() {
             try {
                 const res = await fetch('/api/events');
                 const data = await res.json();
+                
+                // Save current scrolls before re-rendering
+                document.querySelectorAll('.event-card').forEach(card => {
+                    const id = card.getAttribute('data-id');
+                    const headersEl = card.querySelector('.headers-section');
+                    const bodyEl = card.querySelector('.body-pre');
+                    if (id) {
+                        scrollCache[id] = {
+                            headersTop: headersEl ? headersEl.scrollTop : 0,
+                            bodyTop: bodyEl ? bodyEl.scrollTop : 0,
+                            bodyLeft: bodyEl ? bodyEl.scrollLeft : 0
+                        };
+                    }
+                });
+
                 renderEvents(data);
+
+                // Restore scrolls after rendering
+                document.querySelectorAll('.event-card').forEach(card => {
+                    const id = card.getAttribute('data-id');
+                    if (id && scrollCache[id]) {
+                        const state = scrollCache[id];
+                        const headersEl = card.querySelector('.headers-section');
+                        const bodyEl = card.querySelector('.body-pre');
+                        if (headersEl) headersEl.scrollTop = state.headersTop;
+                        if (bodyEl) {
+                            bodyEl.scrollTop = state.bodyTop;
+                            bodyEl.scrollLeft = state.bodyLeft;
+                        }
+                    }
+                });
+
             } catch (e) {
                 console.error("Failed to fetch events", e);
             }
@@ -297,29 +404,40 @@ String _getHtmlUi() {
             fetchEvents();
         }
 
-        function renderKV(obj) {
+        function renderKV(obj, className = "") {
             const keys = Object.keys(obj);
             if (keys.length === 0) return '<div style="color: var(--subtext); font-style: italic;">None</div>';
-            return `<div class="kv-grid">` + 
+            return `<div class="kv-grid \${className}">` + 
                 keys.map(k => `<span class="key">\${k}:</span><span class="val">\${obj[k]}</span>`).join('') + 
                 `</div>`;
+        }
+
+        function formatBody(body) {
+            if (!body) return '(empty body)';
+            try {
+                // Try beautifying if it's JSON
+                const parsed = JSON.parse(body);
+                return JSON.stringify(parsed, null, 2);
+            } catch (e) {
+                return body; // Fallback to raw text
+            }
         }
 
         function renderEvents(events) {
             const list = document.getElementById('list');
             if (!events || events.length === 0) {
-                list.innerHTML = '<div class="empty-state">No webhooks received yet.<br><small>Try: curl http://localhost:8080/webhook?hello=world</small></div>';
+                list.innerHTML = '<div class="empty-state">No webhooks received yet.<br><small>URL: https://webhook-test-ftog.onrender.com/webhook</small></div>';
                 return;
             }
 
             list.innerHTML = events.map(e => `
-                <div class="event-card">
+                <div class="event-card" data-id="\${e.timestamp}">
                     <div class="event-meta">
                         <div class="path-group">
                             <span class="method">\${e.method}</span>
                             <span class="path-text">\${e.path}</span>
                         </div>
-                        <div class="timestamp">\${new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
+                        <div class="timestamp">\${new Date(e.timestamp).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}</div>
                     </div>
 
                     <div style="margin-bottom: 1rem;">
@@ -330,10 +448,10 @@ String _getHtmlUi() {
                     \${renderKV(e.queryParams)}
 
                     <div class="section-header">Headers</div>
-                    \${renderKV(e.headers)}
+                    \${renderKV(e.headers, "headers-section")}
 
                     <div class="section-header">Body Content</div>
-                    <pre class="body-pre">\${e.body || '(empty body)'}</pre>
+                    <pre class="body-pre">\${formatBody(e.body)}</pre>
                 </div>
             `).join('');
         }
